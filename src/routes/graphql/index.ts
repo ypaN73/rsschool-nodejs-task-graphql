@@ -15,8 +15,76 @@ import {
   parse,
   validate,
 } from 'graphql';
+import DataLoader from 'dataloader';
+import { parseResolveInfo } from 'graphql-parse-resolve-info';
+import type { GraphQLResolveInfo } from 'graphql';
 import depthLimit from 'graphql-depth-limit';
 import { UUIDType } from './types/uuid.js';
+
+// ===== CONTEXT INTERFACES =====
+interface GraphQLContext {
+  db: any;
+  dataLoaders: DataLoaderManager;
+}
+
+class DataLoaderManager {
+  constructor(private prisma: any) { }
+
+  readonly profileLoader = new DataLoader<string, any | null>(async (userIds) => {
+    const profiles = await this.prisma.profile.findMany({
+      where: { userId: { in: [...userIds] } }
+    });
+    const profileMap = new Map(profiles.map((p: any) => [p.userId, p]));
+    return userIds.map(id => profileMap.get(id) ?? null);
+  });
+
+  readonly postLoader = new DataLoader<string, any[]>(async (authorIds) => {
+    const posts = await this.prisma.post.findMany({
+      where: { authorId: { in: [...authorIds] } }
+    });
+    const postMap = new Map<string, any[]>();
+    posts.forEach((post: any) => {
+      const existing = postMap.get(post.authorId) ?? [];
+      postMap.set(post.authorId, [...existing, post]);
+    });
+    return authorIds.map(id => postMap.get(id) ?? []);
+  });
+
+  readonly memberTypeLoader = new DataLoader<string, any | null>(async (typeIds) => {
+    const uniqueIds = [...new Set(typeIds)];
+    const types = await this.prisma.memberType.findMany({
+      where: { id: { in: uniqueIds } }
+    });
+    const typeMap = new Map(types.map((t: any) => [t.id, t]));
+    return typeIds.map(id => typeMap.get(id) ?? null);
+  });
+
+  readonly userSubscribedToLoader = new DataLoader<string, any[]>(async (userIds) => {
+    const subscriptions = await this.prisma.subscribersOnAuthors.findMany({
+      where: { subscriberId: { in: [...userIds] } },
+      include: { author: true }
+    });
+    const subscriptionMap = new Map<string, any[]>();
+    subscriptions.forEach((sub: any) => {
+      const existing = subscriptionMap.get(sub.subscriberId) ?? [];
+      subscriptionMap.set(sub.subscriberId, [...existing, sub.author]);
+    });
+    return userIds.map(id => subscriptionMap.get(id) ?? []);
+  });
+
+  readonly subscribedToUserLoader = new DataLoader<string, any[]>(async (userIds) => {
+    const subscribers = await this.prisma.subscribersOnAuthors.findMany({
+      where: { authorId: { in: [...userIds] } },
+      include: { subscriber: true }
+    });
+    const subscriberMap = new Map<string, any[]>();
+    subscribers.forEach((sub: any) => {
+      const existing = subscriberMap.get(sub.authorId) ?? [];
+      subscriberMap.set(sub.authorId, [...existing, sub.subscriber]);
+    });
+    return userIds.map(id => subscriberMap.get(id) ?? []);
+  });
+}
 
 // ===== GRAPHQL TYPES =====
 const MemberTypeId = new GraphQLEnumType({
@@ -53,9 +121,8 @@ const ProfileGQL = new GraphQLObjectType({
     yearOfBirth: { type: new GraphQLNonNull(GraphQLInt) },
     memberType: {
       type: new GraphQLNonNull(MemberTypeGQL),
-      resolve: async (profile: any, _, ctx) => {
-        return ctx.db.memberType.findUnique({ where: { id: profile.memberTypeId } });
-      }
+      resolve: (profile: any, _, ctx: GraphQLContext) =>
+        ctx.dataLoaders.memberTypeLoader.load(profile.memberTypeId)
     }
   })
 });
@@ -68,35 +135,23 @@ const UserGQL = new GraphQLObjectType({
     balance: { type: new GraphQLNonNull(GraphQLFloat) },
     profile: {
       type: ProfileGQL,
-      resolve: async (user: any, _, ctx) => {
-        return ctx.db.profile.findUnique({ where: { userId: user.id } });
-      }
+      resolve: (user: any, _, ctx: GraphQLContext) =>
+        ctx.dataLoaders.profileLoader.load(user.id)
     },
     posts: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(PostGQL))),
-      resolve: async (user: any, _, ctx) => {
-        return ctx.db.post.findMany({ where: { authorId: user.id } });
-      }
+      resolve: (user: any, _, ctx: GraphQLContext) =>
+        ctx.dataLoaders.postLoader.load(user.id)
     },
     userSubscribedTo: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(UserGQL))),
-      resolve: async (user: any, _, ctx) => {
-        const subscriptions = await ctx.db.subscribersOnAuthors.findMany({
-          where: { subscriberId: user.id },
-          include: { author: true }
-        });
-        return subscriptions.map(sub => sub.author);
-      }
+      resolve: (user: any, _, ctx: GraphQLContext) =>
+        ctx.dataLoaders.userSubscribedToLoader.load(user.id)
     },
     subscribedToUser: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(UserGQL))),
-      resolve: async (user: any, _, ctx) => {
-        const subscribers = await ctx.db.subscribersOnAuthors.findMany({
-          where: { authorId: user.id },
-          include: { subscriber: true }
-        });
-        return subscribers.map(sub => sub.subscriber);
-      }
+      resolve: (user: any, _, ctx: GraphQLContext) =>
+        ctx.dataLoaders.subscribedToUserLoader.load(user.id)
     }
   })
 });
@@ -160,49 +215,49 @@ const QueryType = new GraphQLObjectType({
   fields: {
     memberTypes: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(MemberTypeGQL))),
-      resolve: (_, __, ctx) => ctx.db.memberType.findMany()
+      resolve: (_, __, ctx: GraphQLContext) => ctx.db.memberType.findMany()
     },
 
     memberType: {
       type: MemberTypeGQL,
       args: { id: { type: new GraphQLNonNull(MemberTypeId) } },
-      resolve: (_, { id }: { id: string }, ctx) =>
+      resolve: (_, { id }: { id: string }, ctx: GraphQLContext) =>
         ctx.db.memberType.findUnique({ where: { id } })
     },
 
     users: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(UserGQL))),
-      resolve: (_, __, ctx) => ctx.db.user.findMany()
+      resolve: (_, __, ctx: GraphQLContext) => ctx.db.user.findMany()
     },
 
     user: {
       type: UserGQL,
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: (_, { id }: { id: string }, ctx) =>
+      resolve: (_, { id }: { id: string }, ctx: GraphQLContext) =>
         ctx.db.user.findUnique({ where: { id } })
     },
 
     posts: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(PostGQL))),
-      resolve: (_, __, ctx) => ctx.db.post.findMany()
+      resolve: (_, __, ctx: GraphQLContext) => ctx.db.post.findMany()
     },
 
     post: {
       type: PostGQL,
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: (_, { id }: { id: string }, ctx) =>
+      resolve: (_, { id }: { id: string }, ctx: GraphQLContext) =>
         ctx.db.post.findUnique({ where: { id } })
     },
 
     profiles: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(ProfileGQL))),
-      resolve: (_, __, ctx) => ctx.db.profile.findMany()
+      resolve: (_, __, ctx: GraphQLContext) => ctx.db.profile.findMany()
     },
 
     profile: {
       type: ProfileGQL,
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: (_, { id }: { id: string }, ctx) =>
+      resolve: (_, { id }: { id: string }, ctx: GraphQLContext) =>
         ctx.db.profile.findUnique({ where: { id } })
     }
   }
@@ -215,7 +270,7 @@ const MutationType = new GraphQLObjectType({
     createUser: {
       type: UserGQL,
       args: { dto: { type: new GraphQLNonNull(CreateUserInput) } },
-      resolve: (_, { dto }: { dto: { name: string; balance: number } }, ctx) =>
+      resolve: (_, { dto }: { dto: { name: string; balance: number } }, ctx: GraphQLContext) =>
         ctx.db.user.create({ data: dto })
     },
 
@@ -225,14 +280,14 @@ const MutationType = new GraphQLObjectType({
         id: { type: new GraphQLNonNull(UUIDType) },
         dto: { type: new GraphQLNonNull(ChangeUserInput) }
       },
-      resolve: (_, { id, dto }: { id: string; dto: { name?: string; balance?: number } }, ctx) =>
+      resolve: (_, { id, dto }: { id: string; dto: { name?: string; balance?: number } }, ctx: GraphQLContext) =>
         ctx.db.user.update({ where: { id }, data: dto })
     },
 
     deleteUser: {
       type: new GraphQLNonNull(GraphQLString),
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: async (_, { id }: { id: string }, ctx) => {
+      resolve: async (_, { id }: { id: string }, ctx: GraphQLContext) => {
         await ctx.db.user.delete({ where: { id } });
         return 'OK';
       }
@@ -241,7 +296,7 @@ const MutationType = new GraphQLObjectType({
     createProfile: {
       type: ProfileGQL,
       args: { dto: { type: new GraphQLNonNull(CreateProfileInput) } },
-      resolve: (_, { dto }: { dto: { isMale: boolean; yearOfBirth: number; userId: string; memberTypeId: string } }, ctx) =>
+      resolve: (_, { dto }: { dto: { isMale: boolean; yearOfBirth: number; userId: string; memberTypeId: string } }, ctx: GraphQLContext) =>
         ctx.db.profile.create({ data: dto })
     },
 
@@ -251,14 +306,14 @@ const MutationType = new GraphQLObjectType({
         id: { type: new GraphQLNonNull(UUIDType) },
         dto: { type: new GraphQLNonNull(ChangeProfileInput) }
       },
-      resolve: (_, { id, dto }: { id: string; dto: { isMale?: boolean; yearOfBirth?: number; memberTypeId?: string } }, ctx) =>
+      resolve: (_, { id, dto }: { id: string; dto: { isMale?: boolean; yearOfBirth?: number; memberTypeId?: string } }, ctx: GraphQLContext) =>
         ctx.db.profile.update({ where: { id }, data: dto })
     },
 
     deleteProfile: {
       type: new GraphQLNonNull(GraphQLString),
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: async (_, { id }: { id: string }, ctx) => {
+      resolve: async (_, { id }: { id: string }, ctx: GraphQLContext) => {
         await ctx.db.profile.delete({ where: { id } });
         return 'OK';
       }
@@ -267,7 +322,7 @@ const MutationType = new GraphQLObjectType({
     createPost: {
       type: PostGQL,
       args: { dto: { type: new GraphQLNonNull(CreatePostInput) } },
-      resolve: (_, { dto }: { dto: { title: string; content: string; authorId: string } }, ctx) =>
+      resolve: (_, { dto }: { dto: { title: string; content: string; authorId: string } }, ctx: GraphQLContext) =>
         ctx.db.post.create({ data: dto })
     },
 
@@ -277,14 +332,14 @@ const MutationType = new GraphQLObjectType({
         id: { type: new GraphQLNonNull(UUIDType) },
         dto: { type: new GraphQLNonNull(ChangePostInput) }
       },
-      resolve: (_, { id, dto }: { id: string; dto: { title?: string; content?: string } }, ctx) =>
+      resolve: (_, { id, dto }: { id: string; dto: { title?: string; content?: string } }, ctx: GraphQLContext) =>
         ctx.db.post.update({ where: { id }, data: dto })
     },
 
     deletePost: {
       type: new GraphQLNonNull(GraphQLString),
       args: { id: { type: new GraphQLNonNull(UUIDType) } },
-      resolve: async (_, { id }: { id: string }, ctx) => {
+      resolve: async (_, { id }: { id: string }, ctx: GraphQLContext) => {
         await ctx.db.post.delete({ where: { id } });
         return 'OK';
       }
@@ -296,7 +351,7 @@ const MutationType = new GraphQLObjectType({
         userId: { type: new GraphQLNonNull(UUIDType) },
         authorId: { type: new GraphQLNonNull(UUIDType) }
       },
-      resolve: async (_, { userId, authorId }: { userId: string; authorId: string }, ctx) => {
+      resolve: async (_, { userId, authorId }: { userId: string; authorId: string }, ctx: GraphQLContext) => {
         await ctx.db.subscribersOnAuthors.create({
           data: { subscriberId: userId, authorId }
         });
@@ -310,7 +365,7 @@ const MutationType = new GraphQLObjectType({
         userId: { type: new GraphQLNonNull(UUIDType) },
         authorId: { type: new GraphQLNonNull(UUIDType) }
       },
-      resolve: async (_, { userId, authorId }: { userId: string; authorId: string }, ctx) => {
+      resolve: async (_, { userId, authorId }: { userId: string; authorId: string }, ctx: GraphQLContext) => {
         await ctx.db.subscribersOnAuthors.delete({
           where: { subscriberId_authorId: { subscriberId: userId, authorId } }
         });
@@ -339,6 +394,10 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
     },
     async handler(req) {
       const { query, variables } = req.body;
+      const context: GraphQLContext = {
+        db: fastify.prisma,
+        dataLoaders: new DataLoaderManager(fastify.prisma)
+      };
 
       try {
         // Parse and validate query
@@ -354,7 +413,7 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
           schema: graphqlSchema,
           source: query as string,
           variableValues: variables,
-          contextValue: { db: fastify.prisma }
+          contextValue: context
         });
 
         return result;
