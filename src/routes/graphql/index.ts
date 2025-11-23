@@ -28,16 +28,7 @@ interface GraphQLContext {
 }
 
 class DataLoaderManager {
-  private userDataMap: Map<string, PreloadedUserData> | undefined;
-
-  constructor(
-    private prisma: any,
-    preloadedData?: PreloadedUserData[]
-  ) {
-    this.userDataMap = preloadedData
-      ? new Map(preloadedData.map(u => [u.id, u]))
-      : undefined;
-  }
+  constructor(private prisma: any) { }
 
   readonly profileLoader = new DataLoader<string, any | null>(async (userIds) => {
     const profiles = await this.prisma.profile.findMany({
@@ -69,11 +60,6 @@ class DataLoaderManager {
   });
 
   readonly userSubscribedToLoader = new DataLoader<string, any[]>(async (userIds) => {
-    if (this.userDataMap) {
-      return userIds.map(id =>
-        this.userDataMap!.get(id)?.userSubscribedTo?.map((s: any) => s.author) ?? []
-      );
-    }
     const subscriptions = await this.prisma.subscribersOnAuthors.findMany({
       where: { subscriberId: { in: [...userIds] } },
       include: { author: true }
@@ -87,11 +73,6 @@ class DataLoaderManager {
   });
 
   readonly subscribedToUserLoader = new DataLoader<string, any[]>(async (userIds) => {
-    if (this.userDataMap) {
-      return userIds.map(id =>
-        this.userDataMap!.get(id)?.subscribedToUser?.map((s: any) => s.subscriber) ?? []
-      );
-    }
     const subscribers = await this.prisma.subscribersOnAuthors.findMany({
       where: { authorId: { in: [...userIds] } },
       include: { subscriber: true }
@@ -229,90 +210,62 @@ const ChangePostInput = new GraphQLInputObjectType({
 });
 
 // ===== QUERY RESOLVERS =====
-interface PreloadedUserData {
-  id: string;
-  profile?: any;
-  posts?: any[];
-  userSubscribedTo?: { author: any }[];
-  subscribedToUser?: { subscriber: any }[];
-}
-
-function analyzeRequestedFields(info: GraphQLResolveInfo) {
+function hasField(info: GraphQLResolveInfo, fieldName: string): boolean {
   const parsedInfo = parseResolveInfo(info);
 
-  let userSubscribedTo = false;
-  let subscribedToUser = false;
-  let posts = false;
-  let profile = false;
-
-  if (parsedInfo && 'fieldsByTypeName' in parsedInfo) {
-    const userFields = (parsedInfo as any).fieldsByTypeName?.User;
-    if (userFields) {
-      userSubscribedTo = !!userFields.userSubscribedTo;
-      subscribedToUser = !!userFields.subscribedToUser;
-      posts = !!userFields.posts;
-      profile = !!userFields.profile;
-    }
+  if (!parsedInfo || !('fieldsByTypeName' in parsedInfo)) {
+    return false;
   }
 
-  return { userSubscribedTo, subscribedToUser, posts, profile };
+  const userFields = (parsedInfo as any).fieldsByTypeName?.User;
+  if (!userFields) {
+    return false;
+  }
+
+  if (userFields[fieldName]) {
+    return true;
+  }
+
+  return false;
 }
 
 async function fetchUsersWithRelations(db: any, info: GraphQLResolveInfo) {
-  const { userSubscribedTo, subscribedToUser, posts, profile } = analyzeRequestedFields(info);
-
   const includeOptions: any = {};
 
-  if (userSubscribedTo) {
-    includeOptions.userSubscribedTo = { include: { author: true } };
+  if (hasField(info, 'userSubscribedTo')) {
+    includeOptions.userSubscribedTo = {
+      include: { author: true }
+    };
   }
-  if (subscribedToUser) {
-    includeOptions.subscribedToUser = { include: { subscriber: true } };
+
+  if (hasField(info, 'subscribedToUser')) {
+    includeOptions.subscribedToUser = {
+      include: { subscriber: true }
+    };
   }
-  if (posts) {
+
+  if (hasField(info, 'posts')) {
     includeOptions.posts = true;
   }
-  if (profile) {
+
+  if (hasField(info, 'profile')) {
     includeOptions.profile = true;
   }
 
-  const users = await db.user.findMany({
-    include: Object.keys(includeOptions).length ? includeOptions : undefined
-  });
+  if (Object.keys(includeOptions).length > 0) {
+    const users = await db.user.findMany({
+      include: includeOptions
+    });
 
-  return users.map((user: any) => ({
-    ...user,
-    userSubscribedTo: user.userSubscribedTo ?? [],
-    subscribedToUser: user.subscribedToUser ?? [],
-    posts: user.posts ?? []
-  })) as PreloadedUserData[];
-}
+    return users.map((user: any) => ({
+      ...user,
+      userSubscribedTo: user.userSubscribedTo ?? [],
+      subscribedToUser: user.subscribedToUser ?? [],
+      posts: user.posts ?? []
+    }));
+  }
 
-function initializeDataLoadersWithCache(
-  prisma: any,
-  users: PreloadedUserData[]
-) {
-  const loaderManager = new DataLoaderManager(prisma, users);
-
-  // Prime all loaders with preloaded data
-  users.forEach(user => {
-    if (user.profile) {
-      loaderManager.profileLoader.prime(user.id, user.profile);
-    }
-    if (user.posts) {
-      loaderManager.postLoader.prime(user.id, user.posts);
-    }
-    if (user.userSubscribedTo) {
-      const subscribedTo = user.userSubscribedTo.map((rel: any) => rel.author);
-      loaderManager.userSubscribedToLoader.prime(user.id, subscribedTo);
-    }
-    if (user.subscribedToUser) {
-      const subscribers = user.subscribedToUser.map((rel: any) => rel.subscriber);
-      loaderManager.subscribedToUserLoader.prime(user.id, subscribers);
-    }
-  });
-
-  return loaderManager;
+  return await db.user.findMany();
 }
 
 // ===== ROOT QUERY =====
@@ -334,36 +287,7 @@ const QueryType = new GraphQLObjectType({
     users: {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(UserGQL))),
       resolve: async (_, __, ctx: GraphQLContext, info: GraphQLResolveInfo) => {
-        const users = await fetchUsersWithRelations(ctx.db, info);
-
-        // Load member types only if profiles are needed
-        const { profile: needsProfile } = analyzeRequestedFields(info);
-        let memberTypes: any[] = [];
-        if (needsProfile) {
-          memberTypes = await ctx.db.memberType.findMany();
-        }
-
-        // Initialize new loaders with cached data
-        ctx.dataLoaders = initializeDataLoadersWithCache(ctx.db, users);
-
-        // Prime member type loader if we have member types
-        memberTypes.forEach(type => {
-          ctx.dataLoaders.memberTypeLoader.prime(type.id, type);
-        });
-
-        // Prime member types for profiles
-        if (needsProfile) {
-          users.forEach(user => {
-            if (user.profile?.memberTypeId) {
-              const memberType = memberTypes.find(mt => mt.id === user.profile.memberTypeId);
-              if (memberType) {
-                ctx.dataLoaders.memberTypeLoader.prime(user.profile.memberTypeId, memberType);
-              }
-            }
-          });
-        }
-
-        return users;
+        return await fetchUsersWithRelations(ctx.db, info);
       }
     },
 
@@ -531,6 +455,7 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
     },
     async handler(req) {
       const { query, variables } = req.body;
+
       const context: GraphQLContext = {
         db: fastify.prisma,
         dataLoaders: new DataLoaderManager(fastify.prisma)
